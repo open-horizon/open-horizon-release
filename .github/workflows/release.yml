@@ -1,0 +1,508 @@
+name: Open Horizon Release Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION_JSON_FILE:
+        description: "The version json file, check the ReadME for formatting instructions if you are attempting to generate it yourself"
+        required: true
+        type: string
+      INCREMENT_MAJOR_VERSION:
+        description: "Should the major (X.0.0) version be incremented?"
+        required: true
+        type: boolean
+        default: false
+      INCREMENT_MINOR_VERSION:
+        description: "Should the minor (0.X.0) version be incremented?"
+        required: true
+        type: boolean
+        default: false
+      INCREMENT_PATCH_VERSION:
+        description: "Should the patch (0.0.X) version be incremented?"
+        required: true
+        type: boolean
+        default: true
+      IS_LATEST:
+        description: "Should we push the latest Dockerhub tags and mark releases as latest"
+        required: true
+        type: boolean
+        default: true
+
+env:
+  GITHUB_REST_API_VERSION: 2022-11-28
+  # Anax repo release manager variables
+  ANAX_REPOSITORY_OWNER: ${{ github.repository_owner }}
+  ANAX_REPOSITORY_NAME: anax
+  ANAX_RELEASE_MANAGER_FILE_NAME: release.yml
+  ANAX_RELEASE_ENVIRONMENT_NAME: release_environment
+  ANAX_RELEASE_MANAGER_BRANCH: master
+  # Examples repo release manager variables
+  EXAMPLES_REPOSITORY_OWNER: ${{ github.repository_owner }}
+  EXAMPLES_REPOSITORY_NAME: examples
+  EXAMPLES_RELEASE_MANAGER_FILE_NAME: release.yml
+  EXAMPLES_RELEASE_ENVIRONMENT_NAME: release_environment
+  EXAMPLES_RELEASE_MANAGER_BRANCH: master
+
+  # Needs 'repo' scope for org or anax,examples
+  OPENHORIZON_RELEASE_MANAGER_TOKEN: ${{ secrets.OPENHORIZON_RELEASE_MANAGER_TOKEN }}
+
+jobs:
+
+  release:
+    runs-on: ubuntu-20.04
+
+    environment: release_environment
+
+    steps:
+      # Based on user input, increment the OH semantic version variable found in the repo action variables
+      - name: Increment Open Horizon Release Version
+        id: update_version
+        run: |
+          # Use conditional statement to check what version is being incremented in order of precedence
+          if [[ "$INCREMENT_MAJOR_VERSION" = true ]]; then
+            IFS='.' read -r major minor patch <<< "$OPENHORIZON_RELEASE_VERSION"
+            major=$((major+1))
+            minor=0
+            patch=0
+            NEW_RELEASE="$major.$minor.$patch"
+          elif [[ "$INCREMENT_MINOR_VERSION" = true ]]; then
+            IFS='.' read -r major minor patch <<< "$OPENHORIZON_RELEASE_VERSION"
+            minor=$((minor+1))
+            patch=0
+            NEW_RELEASE="$major.$minor.$patch"
+          elif [[ "$INCREMENT_PATCH_VERSION" = true ]]; then
+            IFS='.' read -r major minor patch <<< "$OPENHORIZON_RELEASE_VERSION"
+            patch=$((patch+1))
+            NEW_RELEASE="$major.$minor.$patch"
+          else
+            echo "::warning::No version increment flag set."
+            NEW_RELEASE="$OPENHORIZON_RELEASE_VERSION"
+            exit 0
+          fi
+
+          # Our new release version is sent to actions output to be used by the release step later
+          echo "NEW_RELEASE=$NEW_RELEASE" >> "$GITHUB_OUTPUT"
+
+          # Use API to update the semantic version variable found in our repository actions variables
+          echo "::group::Update Semantic Version Variable via API"
+          UPDATE_SEMANTIC_VERSION_DATA=$(jq -c -n '{"name":"OPENHORIZON_RELEASE_VERSION","value":$NEW_RELEASE}' --arg NEW_RELEASE "${NEW_RELEASE}")
+
+          STATUS_CHECK_UPDATE_VARIABLE=$( \
+            curl -L \
+              -w "%{http_code}\\n" \
+              -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${GITHUB_REST_API_VERSION}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/variables/OPENHORIZON_RELEASE_VERSION \
+              -d "${UPDATE_SEMANTIC_VERSION_DATA}")
+
+          if [[ "${STATUS_CHECK_UPDATE_VARIABLE}" != *"204"* ]]; then
+            echo "::error title=Failed API Call::Update Open Horizon Semantic Version API call returned bad status code"
+            echo -e "Status:\n${STATUS_CHECK_UPDATE_VARIABLE}"
+            exit 1
+          fi
+          echo "::endgroup::"
+        shell: bash
+        env:
+          OPENHORIZON_RELEASE_VERSION: ${{ vars.OPENHORIZON_RELEASE_VERSION }}
+          INCREMENT_MAJOR_VERSION: ${{ github.event.inputs.INCREMENT_MAJOR_VERSION }}
+          INCREMENT_MINOR_VERSION: ${{ github.event.inputs.INCREMENT_MINOR_VERSION }}
+          INCREMENT_PATCH_VERSION: ${{ github.event.inputs.INCREMENT_PATCH_VERSION }}
+
+      # Check if the semantic version has already been released, this typically will throw an error if the user doesn't set the version to increment and the release already exists
+      - name: Check if Open Horizon Release Already Exists
+        run: |
+          echo "::group::Check if Release Already Exists for Version via API"
+          RELEASE_STATUS=$(
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ github.repository }}/releases/tags/v${{ steps.update_version.outputs.NEW_RELEASE }}' \
+              | jq -r '.html_url')
+          
+          sleep 10
+
+          if [[ $RELEASE_STATUS != 'null' ]]; then
+            echo "::error title=Release Already Exists::Attempted to create a release for ${{ steps.update_version.outputs.NEW_RELEASE }}, a version of Open Horizon that already has a release page, see $RELEASE_STATUS"
+            echo "::notice::Consider incrementing the Open Horizon version or deleting the preexisting release"
+            exit 1
+          fi
+          echo "::endgroup::"
+        env:
+          OPENHORIZON_RELEASE_VERSION: ${{ vars.OPENHORIZON_RELEASE_VERSION }}
+
+      # Trigger the Anax Release Manager Workflow (release.yml) to generate the Anax Release
+      - name: Trigger Anax Release Manager
+        run: |
+          # Check if Anax Release Already Exists
+          echo "::group::Check if Anax Release Already Exists via API"
+          RELEASE_STATUS=$(
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/releases/tags/v${{ env.AGBOT_VERSION }}' \
+              | jq -r '.html_url')
+          
+          sleep 10
+
+          if [[ $RELEASE_STATUS != 'null' ]]; then
+            echo "::warning title=Anax Release v${{ env.AGBOT_VERSION }} Exists::Attempted to create a release for a version of Anax that already has a release page, see $RELEASE_STATUS"
+            echo "::notice::Release process will continue without triggering a new Anax release, existing release will be linked to this Open Horizion version"
+            exit 0
+          fi
+          echo "::endgroup::"
+
+          sleep 10
+
+          # Get Anax Release Environment ID
+          echo "::group::Get Anax Release Environment ID via API"
+          ANAX_RELEASE_ENVIRONMENT_ID=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/environments/${{ env.ANAX_RELEASE_ENVIRONMENT_NAME }}' \
+              | \
+              jq -r '.id')
+      
+          if [[ -z "$ANAX_RELEASE_ENVIRONMENT_ID" ]]; then
+            echo "::error title=Failed API Call::Failed to get Anax Release Environment ID, check API Call"
+            exit 1
+          fi
+          echo "::endgroup::"
+      
+          # Trigger Anax Release Manager
+          echo "::group::Trigger Anax Release Manager via API"
+          STATUS_CHECK_ONE=$( \
+            curl -L \
+              -w "%{http_code}\\n" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/actions/workflows/${{ env.ANAX_RELEASE_MANAGER_FILE_NAME }}/dispatches' \
+              -d '{"ref":"${{ env.ANAX_RELEASE_MANAGER_BRANCH }}","inputs":{"AGBOT_VERSION": "${{ env.AGBOT_VERSION }}","ANAX_VERSION": "${{ env.ANAX_VERSION }}","ANAX_K8S_VERSION": "${{ env.ANAX_K8S_VERSION }}","ANAX_CSS_VERSION": "${{ env.ANAX_CSS_VERSION }}","ANAX_ESS_VERSION": "${{ env.ANAX_ESS_VERSION }}","IS_LATEST": "${{ env.IS_LATEST }}"}}')
+
+          if [[ "${STATUS_CHECK_ONE}" != *"204"* ]]; then
+            echo "::error title=Failed API Call::Anax workflow dispatch API call returned bad status code"
+            echo -e "Status:\n${STATUS_CHECK_ONE}"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # List most recent triggered workflows that are waiting for a deployment review, use jq to filter down to release runs created today
+          echo "::group::Get Anax Release Run ID via API"
+          ANAX_RELEASE_RUN_ID=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/actions/runs?status=waiting&event=workflow_dispatch&per_page=10&page=1' \
+              | \
+              jq -r '[.workflow_runs[] | select( .path == ".github/workflows/${{ env.ANAX_RELEASE_MANAGER_FILE_NAME }}" )][0].id')
+
+          if [[ -z "$ANAX_RELEASE_RUN_ID" ]]; then
+            echo "::error title=Failed API Call::Failed to get Anax Release Run ID, check API Call"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # Approve workflow run automatically as this workflow run was approved
+          echo "::group::Approve Anax Release Workflow Dispatch via API"
+          ACCEPT_ANAX_RELEASE_API_CALL_DATA=$(jq -c -n '{"environment_ids":[$ARGS.positional[]],"state":"approved","comment":"Triggered automatically via approval from open-horizon/release"}' --jsonargs $ANAX_RELEASE_ENVIRONMENT_ID)
+
+          STATUS_CHECK_TWO=$( \
+            curl -L \
+              -w "%{http_code}\\n" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              "https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/actions/runs/${ANAX_RELEASE_RUN_ID}/pending_deployments" \
+              -d "${ACCEPT_ANAX_RELEASE_API_CALL_DATA}")
+          
+          if [[ "${STATUS_CHECK_TWO}" != *"200"* ]]; then
+            echo "::error title=Failed API Call::Anax approve workflow dispatch API call returned bad status code"
+            echo -e "Status:\n${STATUS_CHECK_TWO}"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # Wait until the Anax Release Manager has Complete
+          echo "::group::Check and Wait for Anax Release Manager to Complete via API"
+          check_status () {
+          ANAX_RELEASE_STATUS=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}"\
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              "https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/actions/runs/${ANAX_RELEASE_RUN_ID}" \
+              | \
+              jq -r '.status')
+          }
+
+          max_iterations=5
+          check_status
+          while [[ "${ANAX_RELEASE_STATUS}" != "completed" ]]; do
+            sleep 360 #Release manager typically takes around 5.5 minutes
+            check_status
+            max_iterations=$((max_iterations-1))
+            echo "Status Check Complete, Remaining Opportunities ${max_iterations}/5"
+            if [[ "$max_iterations" -le "0" ]]; then
+              echo "::error title=Anax Release Stuck::Anax Release Manager seems to be stuck, status won't hit completion"
+              exit 1
+            fi
+          done
+          echo "Status was marked completed, moving on."
+          echo "::endgroup::"
+
+          sleep 30
+
+          # Confirm that the workflow in the Anax repo ran successfully
+          echo "::group::Get Success Status of Anax Release Workflow via API"
+          ANAX_RELEASE_CONCLUSION=$( \
+              curl -L \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}"\
+                -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+                "https://api.github.com/repos/${{ env.ANAX_REPOSITORY_OWNER }}/${{ env.ANAX_REPOSITORY_NAME }}/actions/runs/${ANAX_RELEASE_RUN_ID}" \
+                | \
+                jq -r '.conclusion')
+          
+          if [[ "${ANAX_RELEASE_CONCLUSION}" != "success" ]]; then
+              echo "::error title=Anax Release Failed::Anax Release Manager appears to have failed, been cancelled, or the API call failed"
+              exit 1
+          fi
+          echo "::endgroup::"
+        shell: bash
+        env:
+          AGBOT_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_agbot }}
+          ANAX_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax }}
+          ANAX_K8S_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax_k8s }}
+          ANAX_CSS_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_cloud-sync-service }}
+          ANAX_ESS_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_edge-sync-service }}
+          IS_LATEST: ${{ github.event.inputs.IS_LATEST }}
+
+      # Trigger the Examples Release Manager Workflow (release.yml) to generate the Examples Release
+      - name: Trigger Examples Release Manager
+        run: |
+          # Check if Examples Release Already Exists
+          echo "::group::Check if Examples Release Already Exists"
+          RELEASE_STATUS=$(
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/releases/tags/v${{ env.AGBOT_VERSION }}' \
+              | jq -r '.html_url')
+          
+          sleep 10
+
+          if [[ $RELEASE_STATUS != 'null' ]]; then
+            echo "::warning title=Examples Release v${{ env.AGBOT_VERSION }} Exists::Attempted to create a release for a version of Examples that already has a release page, see $RELEASE_STATUS"
+            echo "::notice::Release process will continue without triggering a new Examples release, existing release will be linked to this Open Horizion version"
+            exit 0
+          fi
+          echo "::endgroup::"
+
+          sleep 10
+
+          # Get Examples Release Environment ID
+          echo "::group::Get Examples Release Environment ID via API"
+          EXAMPLES_RELEASE_ENVIRONMENT_ID=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/environments/${{ env.EXAMPLES_RELEASE_ENVIRONMENT_NAME }}' \
+              | \
+              jq -r '.id')
+
+          if [[ -z "$EXAMPLES_RELEASE_ENVIRONMENT_ID" ]]; then
+            echo "::error title=Failed API Call::Failed to get Examples Release Environment ID, check API Call"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          # Trigger Examples Release Manager
+          echo "::group::Trigger Examples Release Manager via API"
+          TRIGGER_EXAMPLES_RELEASE_API_CALL_DATA=$(jq -c -n '{"ref":"${{ env.EXAMPLES_RELEASE_MANAGER_BRANCH }}","inputs":{"versionFileJSON": $jsonpayload}}' --arg jsonpayload "${JSON_PAYLOAD//\"/\"}")
+
+          STATUS_CHECK_ONE=$( \
+            curl -L \
+              -w "%{http_code}\\n" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/actions/workflows/${{ env.EXAMPLES_RELEASE_MANAGER_FILE_NAME }}/dispatches \
+              -d "${TRIGGER_EXAMPLES_RELEASE_API_CALL_DATA}")
+
+          if [[ "${STATUS_CHECK_ONE}" != *"204"* ]]; then
+            echo "::error title=Failed API Call::Examples workflow dispatch API call returned bad status code"
+            echo -e "Status:\n${STATUS_CHECK_ONE}"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # List most recent triggered workflows that are waiting for a deployment review, use jq to filter down to release runs created today
+          echo "::group::Get Examples Release Run ID via API"
+          EXAMPLES_RELEASE_RUN_ID=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              'https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/actions/runs?status=waiting&event=workflow_dispatch&per_page=10&page=1' \
+              | \
+              jq -r '[.workflow_runs[] | select( .path == ".github/workflows/${{ env.EXAMPLES_RELEASE_MANAGER_FILE_NAME }}" )][0].id')
+
+          if [[ -z "$EXAMPLES_RELEASE_RUN_ID" ]]; then
+            echo "::error title=Failed API Call::Failed to get Examples Release Run ID, check API Call"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # Approve workflow run automatically as this workflow run was approved
+          echo "::group::Approve Examples Release Workflow Dispatch via API"
+          ACCEPT_EXAMPLES_RELEASE_API_CALL_DATA=$(jq -c -n '{"environment_ids":[$ARGS.positional[]],"state":"approved","comment":"Triggered automatically via approval from open-horizon/release"}' --jsonargs $EXAMPLES_RELEASE_ENVIRONMENT_ID)
+
+          STATUS_CHECK_TWO=$( \
+            curl -L \
+              -w "%{http_code}\\n" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              "https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/actions/runs/${EXAMPLES_RELEASE_RUN_ID}/pending_deployments" \
+              -d "${ACCEPT_EXAMPLES_RELEASE_API_CALL_DATA}")
+          
+          if [[ "${STATUS_CHECK_TWO}" != *"200"* ]]; then
+            echo "::error title=Failed API Call::Examples approve workflow dispatch API call returned bad status code"
+            echo -e "Status:\n${STATUS_CHECK_TWO}"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          sleep 30
+
+          # Wait until the Examples Release Manager has succeeded
+          echo "::group::Wait for Examples Release Manager to Succeed via API"
+          check_status () {
+          EXAMPLES_RELEASE_STATUS=$( \
+            curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}"\
+              -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+              "https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/actions/runs/${EXAMPLES_RELEASE_RUN_ID}" \
+              | \
+              jq -r '.status')
+          }
+
+          max_iterations=5
+          check_status
+          while [[ "${EXAMPLES_RELEASE_STATUS}" != "completed" ]]; do
+            sleep 180 #Release manager typically takes around 2.5 minutes
+            check_status
+            max_iterations=$((max_iterations-1))
+            if [[ "$max_iterations" -le "0" ]]; then
+              echo "::error title=Examples Release Manager Stuck::Examples Release Manager seems to be stuck, status won't hit completion"
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
+          sleep 30
+
+          echo "::group::Get Success Status of Examples Release Workflow via API"
+          EXAMPLES_RELEASE_CONCLUSION=$( \
+              curl -L \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${OPENHORIZON_RELEASE_MANAGER_TOKEN}"\
+                -H "X-GitHub-Api-Version: ${{ env.GITHUB_REST_API_VERSION }}" \
+                "https://api.github.com/repos/${{ env.EXAMPLES_REPOSITORY_OWNER }}/${{ env.EXAMPLES_REPOSITORY_NAME }}/actions/runs/${EXAMPLES_RELEASE_RUN_ID}" \
+                | \
+                jq -r '.conclusion')
+          
+          if [[ "${EXAMPLES_RELEASE_CONCLUSION}" != "success" ]]; then
+              echo "::error::Examples Release Manager appears to have failed or been cancelled"
+              exit 1
+          fi
+          echo "::endgroup::"
+        shell: bash
+        env:
+          AGBOT_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_agbot }}
+          JSON_PAYLOAD: ${{ github.event.inputs.VERSION_JSON_FILE }}
+
+      # Create the Open Horizon Release 
+      - name: Create Open Horizon Release
+        run: |
+          cd $RUNNER_TEMP
+          jq -n '{
+            "open_horizon": "${{ steps.update_version.outputs.NEW_RELEASE }}",
+            "anax": 
+              {
+                "agbot": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_agbot }}",
+                "anax": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax }}",
+                "anax_k8s": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax_k8s }}",
+                "cloud_sync_service": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_cloud-sync-service }}",
+                "edge_sync_service": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_edge-sync-service }}"
+              },
+            "exchange_api": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_exchange-api }}",
+            "vault": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_vault }}",
+            "fdo": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).fdo-owner-services }}",
+            "sdo": "${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).sdo-owner-services }}"
+          }' > Released_Versions.json
+
+          printf "### Open Horizon ${{ steps.update_version.outputs.NEW_RELEASE }} Release Information
+          
+          **Releases tied to v${{ steps.update_version.outputs.NEW_RELEASE }}** \n
+          - Anax: https://github.com/${{ env.ANAX_REPOSITORY_OWNER }}/anax/releases/tag/v${AGBOT_VERSION}
+          - Examples: https://github.com/${{ env.EXAMPLES_REPOSITORY_OWNER }}/examples/releases/tag/v${AGBOT_VERSION}
+          " > OH_RELEASE.txt
+
+          RELEASE_URL=$( \
+            gh release create v${{ steps.update_version.outputs.NEW_RELEASE }} \
+              ${RUNNER_TEMP}/Released_Versions.json \
+              -t "Open Horizon Release v${{ steps.update_version.outputs.NEW_RELEASE }}" \
+              -F OH_RELEASE.txt)
+
+          echo "## Release Success! :tada:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View Release](${RELEASE_URL})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Versions Included in Release" >> $GITHUB_STEP_SUMMARY
+          echo "- Open Horizion: ${{ steps.update_version.outputs.NEW_RELEASE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Anax" >> $GITHUB_STEP_SUMMARY
+          echo "  - Agbot: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_agbot }}" >> $GITHUB_STEP_SUMMARY
+          echo "  - Anax: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax }}" >> $GITHUB_STEP_SUMMARY
+          echo "  - Anax K8s: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_anax_k8s }}" >> $GITHUB_STEP_SUMMARY
+          echo "  - Cloud Sync Service (CSS): ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_cloud-sync-service }}" >> $GITHUB_STEP_SUMMARY
+          echo "  - Edge Sync Service (ESS): ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_edge-sync-service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Exchange API: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_exchange-api }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Vault: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_vault }}" >> $GITHUB_STEP_SUMMARY
+          echo "- FDO: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).fdo-owner-services }}" >> $GITHUB_STEP_SUMMARY
+          echo "- SDO: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).sdo-owner-services }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### JSON Inputted for this Workflow Run" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo "$(jq -n '${{ github.event.inputs.VERSION_JSON_FILE }}')" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+        env:
+          AGBOT_VERSION: ${{ fromJSON(github.event.inputs.VERSION_JSON_FILE).amd64_agbot }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_HOST: github.com
